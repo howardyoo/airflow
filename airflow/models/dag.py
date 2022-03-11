@@ -2283,6 +2283,7 @@ class DAG(LoggingMixin):
         run_type: Optional[DagRunType] = None,
         session=None,
         dag_hash: Optional[str] = None,
+        span_json: Optional[dict] = None,
         creating_job_id: Optional[int] = None,
         data_interval: Optional[Tuple[datetime, datetime]] = None,
     ):
@@ -2354,6 +2355,7 @@ class DAG(LoggingMixin):
             state=state,
             run_type=run_type,
             dag_hash=dag_hash,
+            span_json=span_json,
             creating_job_id=creating_job_id,
             data_interval=data_interval,
         )

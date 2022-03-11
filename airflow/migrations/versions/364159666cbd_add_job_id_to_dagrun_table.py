@@ -37,8 +37,14 @@ depends_on = None
 def upgrade():
     """Apply Add creating_job_id to DagRun table"""
     op.add_column('dag_run', sa.Column('creating_job_id', sa.Integer))
+    # -- HOWARD --
+    op.add_column('dag_run', sa.Column('span_json', sa.PickleType(), nullable=True))
+    op.add_column('task_instance', sa.Column('span_json', sa.PickleType(), nullable=True))
 
 
 def downgrade():
     """Unapply Add job_id to DagRun table"""
     op.drop_column('dag_run', 'creating_job_id')
+    # -- HOWARD --
+    op.drop_column('dag_run', 'span_json')
+    op.drop_column('task_instance', 'span_json')

@@ -43,7 +43,7 @@ from airflow.dag_processing.processor import DagFileProcessorProcess
 from airflow.models import DagModel, errors
 from airflow.models.serialized_dag import SerializedDagModel
 from airflow.models.taskinstance import SimpleTaskInstance
-from airflow.stats import Stats
+from airflow.stats import Stats, Trace
 from airflow.utils import timezone
 from airflow.utils.callback_requests import CallbackRequest, SlaCallbackRequest, TaskCallbackRequest
 from airflow.utils.file import list_py_file_paths, might_contain_dag
@@ -108,6 +108,8 @@ class DagFileProcessorAgent(LoggingMixin, MultiprocessingStartMethodMixin):
     :type async_mode: bool
     """
 
+    tracer = Trace.get_tracer('DagFileProcessingAgent', 'airflow')
+
     def __init__(
         self,
         dag_directory: str,
@@ -162,6 +164,7 @@ class DagFileProcessorAgent(LoggingMixin, MultiprocessingStartMethodMixin):
 
         self.log.info("Launched DagFileProcessorManager with pid: %s", process.pid)
 
+    @tracer.start_as_current_span("run_single_parsing_loop")
     def run_single_parsing_loop(self) -> None:
         """
         Should only be used when launched DAG file processor manager in sync mode.
@@ -218,6 +221,7 @@ class DagFileProcessorAgent(LoggingMixin, MultiprocessingStartMethodMixin):
             # when harvest_serialized_dags calls _heartbeat_manager.
             pass
 
+    @tracer.start_as_current_span("wait_until_finished")
     def wait_until_finished(self) -> None:
         """Waits until DAG parsing is finished."""
         if not self._parent_signal_conn:
@@ -286,6 +290,8 @@ class DagFileProcessorAgent(LoggingMixin, MultiprocessingStartMethodMixin):
 
         processor_manager.start()
 
+    # --- HOWARD ---
+    @tracer.start_as_current_span("heartbeat")
     def heartbeat(self) -> None:
         """Check if the DagFileProcessorManager process is alive, and process any pending messages"""
         if not self._parent_signal_conn:
@@ -336,6 +342,7 @@ class DagFileProcessorAgent(LoggingMixin, MultiprocessingStartMethodMixin):
             reap_process_group(self._process.pid, logger=self.log)
             self.start()
 
+    @tracer.start_as_current_span("_sync_metadata")
     def _sync_metadata(self, stat):
         """Sync metadata from stat queue and only keep the latest stat."""
         self._done = stat.done
@@ -405,6 +412,8 @@ class DagFileProcessorManager(LoggingMixin):
     :param async_mode: whether to start the manager in async mode
     :type async_mode: bool
     """
+
+    tracer = Trace.get_tracer('DagFileProcessorManager', 'airflow')
 
     def __init__(
         self,
@@ -519,6 +528,7 @@ class DagFileProcessorManager(LoggingMixin):
 
         return self._run_parsing_loop()
 
+    @tracer.start_as_current_span("_run_parsing_loop")
     def _run_parsing_loop(self):
 
         # In sync mode we want timeout=None -- wait forever until a message is received
@@ -885,20 +895,22 @@ class DagFileProcessorManager(LoggingMixin):
                 filtered_processors[file_path] = processor
             else:
                 self.log.warning("Stopping processor for %s", file_path)
-                Stats.decr('dag_processing.processes')
+                Stats.decr('dag_processing.processes', attribute={"file_path": file_path})
                 processor.terminate()
                 self._file_stats.pop(file_path)
         self._processors = filtered_processors
 
+    @tracer.start_as_current_span("wait_until_finished")
     def wait_until_finished(self):
         """Sleeps until all the processors are done."""
         for processor in self._processors.values():
             while not processor.done:
                 time.sleep(0.1)
 
+    @tracer.start_as_current_span("_collect_results_from_processor")
     def _collect_results_from_processor(self, processor) -> None:
         self.log.debug("Processor for %s finished", processor.file_path)
-        Stats.decr('dag_processing.processes')
+        Stats.decr('dag_processing.processes', attributes={"file_path": processor.file_path})
         last_finish_time = timezone.utcnow()
 
         if processor.result is not None:
@@ -922,6 +934,7 @@ class DagFileProcessorManager(LoggingMixin):
         file_name = os.path.splitext(os.path.basename(processor.file_path))[0].replace(os.sep, '.')
         Stats.timing(f'dag_processing.last_duration.{file_name}', stat.last_duration)
 
+    @tracer.start_as_current_span("collect_results")
     def collect_results(self) -> None:
         """Collect the result from any finished DAG processors"""
         ready = multiprocessing.connection.wait(self.waitables.keys() - [self._signal_conn], timeout=0)
@@ -939,12 +952,14 @@ class DagFileProcessorManager(LoggingMixin):
         self.log.debug("%s file paths queued for processing", len(self._file_path_queue))
 
     @staticmethod
+    @tracer.start_as_current_span("_create_process")
     def _create_process(file_path, pickle_dags, dag_ids, callback_requests):
         """Creates DagFileProcessorProcess instance."""
         return DagFileProcessorProcess(
             file_path=file_path, pickle_dags=pickle_dags, dag_ids=dag_ids, callback_requests=callback_requests
         )
 
+    @tracer.start_as_current_span("start_new_processes")
     def start_new_processes(self):
         """Start more processors if we have enough slots and files to process"""
         while self._parallelism - len(self._processors) > 0 and self._file_path_queue:
@@ -959,8 +974,9 @@ class DagFileProcessorManager(LoggingMixin):
             )
 
             del self._callback_to_execute[file_path]
-            Stats.incr('dag_processing.processes')
+            Stats.incr('dag_processing.processes', attributes={"file_path": file_path})
 
+            
             processor.start()
             self.log.debug("Started a process (PID: %s) to generate tasks for %s", processor.pid, file_path)
             self._processors[file_path] = processor
@@ -1105,10 +1121,10 @@ class DagFileProcessorManager(LoggingMixin):
                     processor.pid,
                     processor.start_time.isoformat(),
                 )
-                Stats.decr('dag_processing.processes')
-                Stats.incr('dag_processing.processor_timeouts')
+                Stats.decr('dag_processing.processes', attributes={"file_path": file_path})
+                Stats.incr('dag_processing.processor_timeouts', attributes={"file_path": file_path})
                 # TODO: Remove after Airflow 2.0
-                Stats.incr('dag_file_processor_timeouts')
+                Stats.incr('dag_file_processor_timeouts', attributes={"file_path": file_path})
                 processor.kill()
 
     def max_runs_reached(self):
@@ -1128,7 +1144,7 @@ class DagFileProcessorManager(LoggingMixin):
         :return: None
         """
         for processor in self._processors.values():
-            Stats.decr('dag_processing.processes')
+            Stats.decr('dag_processing.processes', attributes={"file_path": processor.file_path})
             processor.terminate()
 
     def end(self):

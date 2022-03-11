@@ -40,3 +40,4 @@ def upgrade():
 
 def downgrade():
     op.drop_column('task_instance', 'pool_slots')
+

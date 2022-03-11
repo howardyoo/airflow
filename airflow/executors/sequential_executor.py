@@ -24,11 +24,17 @@ SequentialExecutor
 """
 import subprocess
 from typing import Any, Optional
-
+import time
 from airflow.executors.base_executor import BaseExecutor, CommandType
 from airflow.models.taskinstance import TaskInstanceKey
 from airflow.utils.state import State
 
+from airflow.stats import Stats, Trace
+from airflow.models.dag import DagRun
+from airflow import settings
+
+from opentelemetry import trace
+from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
 
 class SequentialExecutor(BaseExecutor):
     """
@@ -55,15 +61,39 @@ class SequentialExecutor(BaseExecutor):
         self.commands_to_run.append((key, command))
 
     def sync(self) -> None:
+        session = settings.Session()
         for key, command in self.commands_to_run:
             self.log.info("Executing command: %s", command)
+            dagruns = DagRun.find(dag_id=key.dag_id, run_id=key.run_id, session=session)
+            if len(dagruns) == 1:
+                dagrun = dagruns[0]
+                ti = dagrun.get_task_instance(task_id=key.task_id, session=session)
+                span = Trace.get_span_from_json(ti.span_json)
+                # we have to modify the 'actual start time' 
 
-            try:
-                subprocess.check_call(command, close_fds=True)
-                self.change_state(key, State.SUCCESS)
-            except subprocess.CalledProcessError as e:
-                self.change_state(key, State.FAILED)
-                self.log.error("Failed to execute task %s.", str(e))
+                span_name = f"{ti.task_id}-{command[1]}-{command[2]}"
+                execution_span = Trace.start_span_from_taskinstance(service_name=self.__class__.__name__, span_name=span_name, ti=ti)
+                execution_span.set_attributes({
+                    "command": f"{command[1]} {command[2]}",
+                    "dag_id": command[3],
+                    "task_id": command[4],
+                    "run_id": command[5]
+                }) # we could add more details to here.
+
+                try:
+                    subprocess.check_call(command, close_fds=True)
+                    self.change_state(key, State.SUCCESS)
+                    span.set_attribute("state", State.SUCCESS)
+                except subprocess.CalledProcessError as e:
+                    self.change_state(key, State.FAILED)
+                    self.log.error("Failed to execute task %s.", str(e))
+                    span.set_attribute("state", State.FAILED)
+                    span.set_attribute("error", "true")
+                    span.add_event(name="subprocess.CalledProcessError", attributes={"message": str(e)})
+
+                print(f"sequential-executor sync -> {execution_span.to_json()}")
+                execution_span.end()
+                span.end()
 
         self.commands_to_run = []
 

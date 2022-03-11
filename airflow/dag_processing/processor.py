@@ -53,6 +53,7 @@ from airflow.utils.state import State
 DR = models.DagRun
 TI = models.TaskInstance
 
+from airflow.stats import Trace
 
 class DagFileProcessorProcess(LoggingMixin, MultiprocessingStartMethodMixin):
     """Runs DAG processing in a separate process using DagFileProcessor
@@ -169,6 +170,9 @@ class DagFileProcessorProcess(LoggingMixin, MultiprocessingStartMethodMixin):
                 )
                 result_channel.send(result)
             log.info("Processing %s took %.3f seconds", file_path, timer.duration)
+            # --- HOWARD ---
+            # store it as histogram
+            Stats.timing("dag.processor.parse.time", timer.duration, attributes={"file_path": file_path})
         except Exception:
             # Log exceptions through the logging framework.
             log.exception("Got an exception! Propagating...")
@@ -514,7 +518,7 @@ class DagFileProcessor(LoggingMixin):
                     email_sent = True
                     notification_sent = True
                 except Exception:
-                    Stats.incr('sla_email_notification_failure')
+                    Stats.incr('sla_email_notification_failure', attributes={"email": str(emails)})
                     self.log.exception("Could not send SLA Miss email notification for DAG %s", dag.dag_id)
             # If we sent any notification, update the sla_miss table
             if notification_sent:
@@ -641,11 +645,13 @@ class DagFileProcessor(LoggingMixin):
         """
         self.log.info("Processing file %s for tasks to queue", file_path)
 
+
         try:
             dagbag = DagBag(file_path, include_examples=False, include_smart_sensor=False)
         except Exception:
             self.log.exception("Failed at reloading the DAG file %s", file_path)
-            Stats.incr('dag_file_refresh_error', 1, 1)
+            # _span_1.add_event("error", attributes={"message": "Failed at reloading the DAG file", "file_path": file_path})
+            Stats.incr('dag_file_refresh_error', 1, 1, attributes={"file_path": file_path})
             return 0, 0
 
         self._deactivate_missing_dags(session, dagbag, file_path)
@@ -660,6 +666,7 @@ class DagFileProcessor(LoggingMixin):
         self.execute_callbacks(dagbag, callback_requests)
 
         # Save individual DAGs in the ORM
+        # with tracer.start_as_current_span("sync_to_db") as _span_2:
         dagbag.sync_to_db()
 
         if pickle_dags:

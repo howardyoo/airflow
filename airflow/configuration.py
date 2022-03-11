@@ -175,6 +175,13 @@ class AirflowConfigParser(ConfigParser):
         ('core', 'max_active_tasks_per_dag'): ('core', 'dag_concurrency', '2.2.0'),
         ('logging', 'worker_log_server_port'): ('celery', 'worker_log_server_port', '2.2.0'),
         ('api', 'access_control_allow_origins'): ('api', 'access_control_allow_origin', '2.2.0'),
+        # ----- OTEL related configuration added ------
+        ('metrics', 'otel_on'): ('scheduler', 'otel_on', '2.0.0'),
+        ('metrics', 'otel_host'): ('scheduler', 'otel_host', '2.0.0'),
+        ('metrics', 'otel_port'): ('scheduler', 'otel_port', '2.0.0'),
+        ('metrics', 'otel_prefix'): ('scheduler', 'otel_prefix', '2.0.0'),
+        ('metrics', 'otel_allow_list'): ('scheduler', 'otel_allow_list', '2.0.0'),
+        ('metrics', 'otel_debug'): ('scheduler', 'otel_debug', '2.0.0'),
     }
 
     # A mapping of old default values that we want to change and warn the user

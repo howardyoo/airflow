@@ -45,7 +45,7 @@ from airflow.models.dagbag import DagBag
 from airflow.models.dagrun import DagRun
 from airflow.models.serialized_dag import SerializedDagModel
 from airflow.models.taskinstance import SimpleTaskInstance, TaskInstance, TaskInstanceKey
-from airflow.stats import Stats
+from airflow.stats import Stats, Trace
 from airflow.ti_deps.dependencies_states import EXECUTION_STATES
 from airflow.utils import timezone
 from airflow.utils.callback_requests import DagCallbackRequest, TaskCallbackRequest
@@ -100,6 +100,7 @@ class SchedulerJob(BaseJob):
 
     __mapper_args__ = {'polymorphic_identity': 'SchedulerJob'}
     heartrate: int = conf.getint('scheduler', 'SCHEDULER_HEARTBEAT_SEC')
+    tracer = Trace.get_tracer('scheduler', 'airflow')
 
     def __init__(
         self,
@@ -212,6 +213,7 @@ class SchedulerJob(BaseJob):
         )
 
     @provide_session
+    @tracer.start_as_current_span("__get_concurrency_maps")
     def __get_concurrency_maps(
         self, states: List[TaskInstanceState], session: Session = None
     ) -> Tuple[DefaultDict[str, int], DefaultDict[Tuple[str, str], int]]:
@@ -238,6 +240,7 @@ class SchedulerJob(BaseJob):
         return dag_map, task_map
 
     @provide_session
+    @tracer.start_as_current_span("_executable_task_instances_to_queued")
     def _executable_task_instances_to_queued(self, max_tis: int, session: Session = None) -> List[TI]:
         """
         Finds TIs that are ready for execution with respect to pool limits,
@@ -446,6 +449,7 @@ class SchedulerJob(BaseJob):
         return executable_tis
 
     @provide_session
+    @tracer.start_as_current_span("_enqueue_task_instances_with_queued_state")
     def _enqueue_task_instances_with_queued_state(
         self, task_instances: List[TI], session: Session = None
     ) -> None:
@@ -479,6 +483,7 @@ class SchedulerJob(BaseJob):
                 queue=queue,
             )
 
+    @tracer.start_as_current_span("_critical_section_execute_task_instances")
     def _critical_section_execute_task_instances(self, session: Session) -> int:
         """
         Attempts to execute TaskInstances that should be executed by the scheduler.
@@ -509,6 +514,7 @@ class SchedulerJob(BaseJob):
         return len(queued_tis)
 
     @provide_session
+    @tracer.start_as_current_span("_process_executor_events")
     def _process_executor_events(self, session: Session = None) -> int:
         """Respond to executor events."""
         if not self.processor_agent:
@@ -719,55 +725,63 @@ class SchedulerJob(BaseJob):
         )
 
         for loop_count in itertools.count(start=1):
-            with Stats.timer() as timer:
+            # --- HOWARD ---
+            tracer = Trace.get_tracer("scheduler", "airflow")
+            with tracer.start_as_current_span("_run_scheduler_loop") as _root_span:
+                with Stats.timer() as timer:
 
-                if self.using_sqlite:
-                    self.processor_agent.run_single_parsing_loop()
-                    # For the sqlite case w/ 1 thread, wait until the processor
-                    # is finished to avoid concurrent access to the DB.
-                    self.log.debug("Waiting for processors to finish since we're using sqlite")
-                    self.processor_agent.wait_until_finished()
+                    if self.using_sqlite:
+                        with tracer.start_as_current_span("processor_agent.run_single_parsing_loop") as _span_1:
+                            self.processor_agent.run_single_parsing_loop()
+                            # For the sqlite case w/ 1 thread, wait until the processor
+                            # is finished to avoid concurrent access to the DB.
+                            self.log.debug("Waiting for processors to finish since we're using sqlite")
+                            self.processor_agent.wait_until_finished()
 
-                with create_session() as session:
-                    num_queued_tis = self._do_scheduling(session)
+                    with create_session() as session:
+                        num_queued_tis = self._do_scheduling(session)
 
-                    self.executor.heartbeat()
-                    session.expunge_all()
-                    num_finished_events = self._process_executor_events(session=session)
+                        self.executor.heartbeat()
+                        session.expunge_all()
+                        num_finished_events = self._process_executor_events(session=session)
 
-                self.processor_agent.heartbeat()
+                    with tracer.start_as_current_span("processor_agent.heartbeat") as _span_2:
+                        self.processor_agent.heartbeat()
 
-                # Heartbeat the scheduler periodically
-                self.heartbeat(only_if_necessary=True)
+                    # Heartbeat the scheduler periodically
+                    with tracer.start_as_current_span("heartbeat") as _span_3:
+                        self.heartbeat(only_if_necessary=True)
 
-                # Run any pending timed events
-                next_event = timers.run(blocking=False)
-                self.log.debug("Next timed event is in %f", next_event)
+                    # Run any pending timed events
+                    next_event = timers.run(blocking=False)
+                    self.log.debug("Next timed event is in %f", next_event)
 
-            self.log.debug("Ran scheduling loop in %.2f seconds", timer.duration)
+                self.log.debug("Ran scheduling loop in %.2f seconds", timer.duration)
 
-            if not is_unit_test and not num_queued_tis and not num_finished_events:
-                # If the scheduler is doing things, don't sleep. This means when there is work to do, the
-                # scheduler will run "as quick as possible", but when it's stopped, it can sleep, dropping CPU
-                # usage when "idle"
-                time.sleep(min(self._scheduler_idle_sleep_time, next_event))
+                if not is_unit_test and not num_queued_tis and not num_finished_events:
+                    # If the scheduler is doing things, don't sleep. This means when there is work to do, the
+                    # scheduler will run "as quick as possible", but when it's stopped, it can sleep, dropping CPU
+                    # usage when "idle"
+                    with tracer.start_as_current_span("time.sleep") as _span_4:
+                        time.sleep(min(self._scheduler_idle_sleep_time, next_event))
 
-            if loop_count >= self.num_runs > 0:
-                self.log.info(
-                    "Exiting scheduler loop as requested number of runs (%d - got to %d) has been reached",
-                    self.num_runs,
-                    loop_count,
-                )
-                break
-            if self.processor_agent.done:
-                self.log.info(
-                    "Exiting scheduler loop as requested DAG parse count (%d) has been reached after %d"
-                    " scheduler loops",
-                    self.num_times_parse_dags,
-                    loop_count,
-                )
-                break
+                if loop_count >= self.num_runs > 0:
+                    self.log.info(
+                        "Exiting scheduler loop as requested number of runs (%d - got to %d) has been reached",
+                        self.num_runs,
+                        loop_count,
+                    )
+                    break
+                if self.processor_agent.done:
+                    self.log.info(
+                        "Exiting scheduler loop as requested DAG parse count (%d) has been reached after %d"
+                        " scheduler loops",
+                        self.num_times_parse_dags,
+                        loop_count,
+                    )
+                    break
 
+    @tracer.start_as_current_span("_do_scheduling")
     def _do_scheduling(self, session) -> int:
         """
         This function is where the main scheduling decisions take places. It:
@@ -856,14 +870,17 @@ class SchedulerJob(BaseJob):
                 raise
 
             guard.commit()
+
             return num_queued_tis
 
     @retry_db_transaction
+    @tracer.start_as_current_span("_get_next_dagruns_to_examine")
     def _get_next_dagruns_to_examine(self, state: DagRunState, session: Session):
         """Get Next DagRuns to Examine with retries"""
         return DagRun.next_dagruns_to_examine(state, session)
 
     @retry_db_transaction
+    @tracer.start_as_current_span("_create_dagruns_for_dags")
     def _create_dagruns_for_dags(self, guard, session):
         """Find Dag Models needing DagRuns and Create Dag Runs with retries in case of OperationalError"""
         query = DagModel.dags_needing_dagruns(session)
@@ -873,6 +890,7 @@ class SchedulerJob(BaseJob):
         guard.commit()
         # END: create dagruns
 
+    @tracer.start_as_current_span("_create_dag_runs")
     def _create_dag_runs(self, dag_models: Collection[DagModel], session: Session) -> None:
         """
         Unconditionally create a DAG run for the given DAG, and update the dag_model's fields to control
@@ -942,6 +960,7 @@ class SchedulerJob(BaseJob):
         # TODO[HA]: Should we do a session.flush() so we don't have to keep lots of state/object in
         # memory for larger dags? or expunge_all()
 
+    @tracer.start_as_current_span("_should_update_dag_next_dagruns")
     def _should_update_dag_next_dagruns(self, dag, dag_model: DagModel, total_active_runs) -> bool:
         """Check if the dag's next_dagruns_create_after should be updated."""
         if total_active_runs >= dag.max_active_runs:
@@ -955,6 +974,7 @@ class SchedulerJob(BaseJob):
             return False
         return True
 
+    @tracer.start_as_current_span("_start_queued_dagruns")
     def _start_queued_dagruns(
         self,
         session: Session,
@@ -970,6 +990,7 @@ class SchedulerJob(BaseJob):
         def _update_state(dag: DAG, dag_run: DagRun):
             dag_run.state = State.RUNNING
             dag_run.start_date = timezone.utcnow()
+
             if dag.timetable.periodic:
                 # TODO: Logically, this should be DagRunInfo.run_after, but the
                 # information is not stored on a DagRun, only before the actual
@@ -978,7 +999,7 @@ class SchedulerJob(BaseJob):
                 # always happening immediately after the data interval.
                 expected_start_date = dag.get_run_data_interval(dag_run).end
                 schedule_delay = dag_run.start_date - expected_start_date
-                Stats.timing(f'dagrun.schedule_delay.{dag.dag_id}', schedule_delay)
+                Stats.timing(f'dagrun.schedule_delay.{dag.dag_id}', schedule_delay, attributes={"dag_id": dag.dag_id})
 
         for dag_run in dag_runs:
 
@@ -999,6 +1020,7 @@ class SchedulerJob(BaseJob):
                 active_runs_of_dags[dag_run.dag_id] += 1
                 _update_state(dag, dag_run)
 
+    @tracer.start_as_current_span("_schedule_dag_run")
     def _schedule_dag_run(
         self,
         dag_run: DagRun,
@@ -1074,6 +1096,7 @@ class SchedulerJob(BaseJob):
         return callback_to_run
 
     @provide_session
+    @tracer.start_as_current_span("_verify_integrity_if_dag_chagned")
     def _verify_integrity_if_dag_changed(self, dag_run: DagRun, session=None):
         """Only run DagRun.verify integrity if Serialized DAG has changed since it is slow"""
         latest_version = SerializedDagModel.get_latest_version_hash(dag_run.dag_id, session=session)
@@ -1089,6 +1112,7 @@ class SchedulerJob(BaseJob):
         # Verify integrity also takes care of session.flush
         dag_run.verify_integrity(session=session)
 
+    @tracer.start_as_current_span("_send_dag_callbacks_to_processor")
     def _send_dag_callbacks_to_processor(self, dag: DAG, callback: Optional[DagCallbackRequest] = None):
         if not self.processor_agent:
             raise ValueError("Processor agent is not started.")
@@ -1097,6 +1121,7 @@ class SchedulerJob(BaseJob):
         if callback:
             self.processor_agent.send_callback_to_execute(callback)
 
+    @tracer.start_as_current_span("_send_sla_callbacks_to_processor")
     def _send_sla_callbacks_to_processor(self, dag: DAG):
         """Sends SLA Callbacks to DagFileProcessor if tasks have SLAs set and check_slas=True"""
         if not settings.CHECK_SLAS:
@@ -1117,15 +1142,17 @@ class SchedulerJob(BaseJob):
     def _emit_pool_metrics(self, session: Session = None) -> None:
         pools = models.Pool.slots_stats(session=session)
         for pool_name, slot_stats in pools.items():
-            Stats.gauge(f'pool.open_slots.{pool_name}', slot_stats["open"])
-            Stats.gauge(f'pool.queued_slots.{pool_name}', slot_stats[State.QUEUED])  # type: ignore
-            Stats.gauge(f'pool.running_slots.{pool_name}', slot_stats[State.RUNNING])  # type: ignore
+            Stats.gauge(f'pool.open_slots.{pool_name}', slot_stats["open"], attributes={"pool_name": pool_name, "status": "open"})
+            Stats.gauge(f'pool.queued_slots.{pool_name}', slot_stats[State.QUEUED], attributes={"pool_name": pool_name, "status": "queued"})  # type: ignore
+            Stats.gauge(f'pool.running_slots.{pool_name}', slot_stats[State.RUNNING], attributes={"pool_name": pool_name, "status": "running"})  # type: ignore
 
     @provide_session
+    @tracer.start_as_current_span("heartbeat_callback")
     def heartbeat_callback(self, session: Session = None) -> None:
         Stats.incr('scheduler_heartbeat', 1, 1)
 
     @provide_session
+    @tracer.start_as_current_span("adopt_or_reset_orphaned_tasks")
     def adopt_or_reset_orphaned_tasks(self, session: Session = None):
         """
         Reset any TaskInstance still in QUEUED or SCHEDULED states that were
@@ -1214,6 +1241,7 @@ class SchedulerJob(BaseJob):
         return len(to_reset)
 
     @provide_session
+    @tracer.start_as_current_span("check_trigger_timeouts")
     def check_trigger_timeouts(self, session: Session = None):
         """
         Looks at all tasks that are in the "deferred" state and whose trigger

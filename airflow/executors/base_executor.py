@@ -21,9 +21,15 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from airflow.configuration import conf
 from airflow.models.taskinstance import TaskInstance, TaskInstanceKey
-from airflow.stats import Stats
+from airflow.stats import Stats, Trace
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.state import State
+
+# -- HOWARD
+from opentelemetry import trace
+from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
+from airflow import settings
+from airflow.models.dag import DagRun
 
 PARALLELISM: int = conf.getint('core', 'PARALLELISM')
 
@@ -56,6 +62,7 @@ class BaseExecutor(LoggingMixin):
     """
 
     job_id: Optional[str] = None
+    _tracer = Trace.get_tracer('executor', 'airflow')
 
     def __init__(self, parallelism: int = PARALLELISM):
         super().__init__()
@@ -63,6 +70,7 @@ class BaseExecutor(LoggingMixin):
         self.queued_tasks: OrderedDict[TaskInstanceKey, QueuedTaskInstanceType] = OrderedDict()
         self.running: Set[TaskInstanceKey] = set()
         self.event_buffer: Dict[TaskInstanceKey, EventBufferValueType] = {}
+        self.tracer = Trace.get_tracer(self.__class__.__name__, application="airflow")
 
     def __repr__(self):
         return f"{self.__class__.__name__}(parallelism={self.parallelism})"
@@ -70,6 +78,7 @@ class BaseExecutor(LoggingMixin):
     def start(self):  # pragma: no cover
         """Executors may need to get things started."""
 
+    @_tracer.start_as_current_span("queue_command")
     def queue_command(
         self,
         task_instance: TaskInstance,
@@ -80,10 +89,26 @@ class BaseExecutor(LoggingMixin):
         """Queues command to task"""
         if task_instance.key not in self.queued_tasks and task_instance.key not in self.running:
             self.log.info("Adding to queue: %s", command)
+            # --- HOWARD ---
+            span = Trace.get_span_from_json(task_instance.span_json)
+            tracer = Trace.get_tracer(service=self.__class__.__name__, application="airflow")
+            span_name = f"{task_instance.task_id}-queue-command"
+            ctx = trace.set_span_in_context(NonRecordingSpan(span.get_span_context()))
+            execution_span = tracer.start_span(span_name, context=ctx)
+            execution_span.set_attributes({
+                "command": f"{command[1]} {command[2]}",
+                "dag_id": command[3],
+                "task_id": command[4],
+                "run_id": command[5]
+            }) # we could add more details to here.
+
             self.queued_tasks[task_instance.key] = (command, priority, queue, task_instance)
+
+            execution_span.end()
         else:
             self.log.error("could not queue task %s", task_instance.key)
 
+    @_tracer.start_as_current_span("queue_task_instance")
     def queue_task_instance(
         self,
         task_instance: TaskInstance,
@@ -131,12 +156,14 @@ class BaseExecutor(LoggingMixin):
         """
         return task_instance.key in self.queued_tasks or task_instance.key in self.running
 
+    @_tracer.start_as_current_span("sync")
     def sync(self) -> None:
         """
         Sync will get called periodically by the heartbeat method.
         Executors should override this to perform gather statuses.
         """
 
+    @_tracer.start_as_current_span("heartbeat")
     def heartbeat(self) -> None:
         """Heartbeat sent to trigger new jobs."""
         if not self.parallelism:
@@ -151,16 +178,17 @@ class BaseExecutor(LoggingMixin):
         self.log.debug("%s in queue", num_queued_tasks)
         self.log.debug("%s open slots", open_slots)
 
-        Stats.gauge('executor.open_slots', open_slots)
-        Stats.gauge('executor.queued_tasks', num_queued_tasks)
-        Stats.gauge('executor.running_tasks', num_running_tasks)
-
-        self.trigger_tasks(open_slots)
+        Stats.gauge('executor.open_slots', open_slots, attributes={"status": "open", "name": self.__class__.__name__})
+        Stats.gauge('executor.queued_tasks', num_queued_tasks, attributes={"status": "queued", "name": self.__class__.__name__})
+        Stats.gauge('executor.running_tasks', num_running_tasks, attributes={"status": "running", "name": self.__class__.__name__})
+        self.trigger_tasks(open_slots)  # -- HOWARD - this is where the tasks will be enqueued.
 
         # Calling child class sync method
         self.log.debug("Calling the %s sync method", self.__class__)
-        self.sync()
+        # -- we should create span here - for the 
+        self.sync()     # -- HOWARD - this is where the actual 'running' of the tasks will be done
 
+    @_tracer.start_as_current_span("order_queued_tasks_by_priority")
     def order_queued_tasks_by_priority(self) -> List[Tuple[TaskInstanceKey, QueuedTaskInstanceType]]:
         """
         Orders the queued tasks by priority.
@@ -173,6 +201,7 @@ class BaseExecutor(LoggingMixin):
             reverse=True,
         )
 
+    @_tracer.start_as_current_span("trigger_tasks")
     def trigger_tasks(self, open_slots: int) -> None:
         """
         Triggers tasks
@@ -185,8 +214,12 @@ class BaseExecutor(LoggingMixin):
             key, (command, _, queue, ti) = sorted_queue.pop(0)
             self.queued_tasks.pop(key)
             self.running.add(key)
+            # - HOWARD the execute_async does not actually runs the
+            # command, but puts them into the 'list'
+            # the command actually does get fired during the 'sync()' function at the end.
             self.execute_async(key=key, command=command, queue=queue, executor_config=ti.executor_config)
 
+    @_tracer.start_as_current_span("change_state")
     def change_state(self, key: TaskInstanceKey, state: str, info=None) -> None:
         """
         Changes state of the task.
@@ -198,10 +231,21 @@ class BaseExecutor(LoggingMixin):
         self.log.debug("Changing state: %s", key)
         try:
             self.running.remove(key)
+            # --- HOWARD ---
+            # wrap up the task instance here.
+            session = settings.Session()
+            dagruns = DagRun.find(dag_id=key.dag_id, run_id=key.run_id, session=session)
+            if len(dagruns) == 1:
+                dagrun = dagruns[0]
+                ti = dagrun.get_task_instance(task_id=key.task_id, session=session)
+                span = Trace.get_span_from_json(ti.span_json)
+                span.set_attribute("state", state)
+                span.end()
         except KeyError:
             self.log.debug('Could not find key: %s', str(key))
         self.event_buffer[key] = state, info
 
+    @_tracer.start_as_current_span("fail")
     def fail(self, key: TaskInstanceKey, info=None) -> None:
         """
         Set fail state for the event.
@@ -211,6 +255,7 @@ class BaseExecutor(LoggingMixin):
         """
         self.change_state(key, State.FAILED, info)
 
+    @_tracer.start_as_current_span("success")
     def success(self, key: TaskInstanceKey, info=None) -> None:
         """
         Set success state for the event.
@@ -240,6 +285,7 @@ class BaseExecutor(LoggingMixin):
 
         return cleared_events
 
+    @_tracer.start_as_current_span("execute_async")
     def execute_async(
         self,
         key: TaskInstanceKey,

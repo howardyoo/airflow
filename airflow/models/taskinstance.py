@@ -78,7 +78,7 @@ from airflow.models.taskreschedule import TaskReschedule
 from airflow.models.xcom import XCOM_RETURN_KEY, XCom
 from airflow.plugins_manager import integrate_macros_plugins
 from airflow.sentry import Sentry
-from airflow.stats import Stats
+from airflow.stats import Stats, Trace
 from airflow.ti_deps.dep_context import DepContext
 from airflow.ti_deps.dependencies_deps import REQUEUEABLE_DEPS, RUNNING_DEPS
 from airflow.timetables.base import DataInterval
@@ -96,6 +96,13 @@ from airflow.utils.session import create_session, provide_session
 from airflow.utils.sqlalchemy import ExtendedJSON, UtcDateTime, with_row_locks
 from airflow.utils.state import DagRunState, State
 from airflow.utils.timeout import timeout
+
+# -- HOWARD
+import pickle
+import traceback
+from airflow import settings
+from opentelemetry.trace import Link
+from opentelemetry.trace import Span
 
 try:
     from kubernetes.client.api_client import ApiClient
@@ -343,6 +350,7 @@ class TaskInstance(Base, LoggingMixin):
     queued_by_job_id = Column(Integer)
     pid = Column(Integer)
     executor_config = Column(PickleType(pickler=dill))
+    span_json = Column(PickleType)
 
     external_executor_id = Column(String(ID_LEN, **COLLATION_ARGS))
 
@@ -406,6 +414,7 @@ class TaskInstance(Base, LoggingMixin):
     def __init__(
         self, task, execution_date: Optional[datetime] = None, run_id: str = None, state: Optional[str] = None
     ):
+        from airflow.models.dagrun import DagRun  # Avoid circular import
         super().__init__()
         self.dag_id = task.dag_id
         self.task_id = task.task_id
@@ -413,8 +422,6 @@ class TaskInstance(Base, LoggingMixin):
         self._log = logging.getLogger("airflow.task")
 
         if run_id is None and execution_date is not None:
-            from airflow.models.dagrun import DagRun  # Avoid circular import
-
             warnings.warn(
                 "Passing an execution_date to `TaskInstance()` is deprecated in favour of passing a run_id",
                 DeprecationWarning,
@@ -452,7 +459,22 @@ class TaskInstance(Base, LoggingMixin):
         if state:
             self.state = state
         self.hostname = ''
+        # --- HOWARD ---
+        # -- initialize task span and store it into span_json
+        session = settings.Session()
+        dagruns = DagRun.find(dag_id=self.dag_id, run_id=self.run_id, session=session)
+        if len(dagruns) == 1:
+            dagrun = dagruns[0]
+            span_name = f"{self.task_id}"
+            span = Trace.start_span_from_dagrun(service_name=self.__class__.__name__, span_name=span_name, dagrun=dagrun)
+            span.set_attributes({
+                "dag_id": self.dag_id, "task_id": self.task_id, "run_id": self.run_id,
+                "operator": self.operator, "job_id": self.job_id, "try_number": self.try_number,
+                "max_tries": self.max_tries, "start_time": span._start_time, "operator": self.operator
+            })
+            self.span_json = span.to_json()
         self.init_on_load()
+        
         # Is this TaskInstance being currently running within `airflow tasks run --raw`.
         # Not persisted to the database so only valid for the current process
         self.raw = False
@@ -756,6 +778,7 @@ class TaskInstance(Base, LoggingMixin):
             self.trigger_id = ti.trigger_id
             self.next_method = ti.next_method
             self.next_kwargs = ti.next_kwargs
+            self.span_json = ti.span_json
         else:
             self.state = None
 
@@ -822,6 +845,7 @@ class TaskInstance(Base, LoggingMixin):
             self.duration = (self.end_date - self.start_date).total_seconds()
         session.merge(self)
 
+
     @property
     def is_premature(self):
         """
@@ -856,6 +880,7 @@ class TaskInstance(Base, LoggingMixin):
             TaskInstance.state.in_([State.SKIPPED, State.SUCCESS]),
         )
         count = ti[0][0]
+        # --- HOWARD - linking opportunity of the tasks that were successful.
         return count == len(task.downstream_task_ids)
 
     @provide_session
@@ -1245,10 +1270,12 @@ class TaskInstance(Base, LoggingMixin):
         self.log.info(hr_line_break)
         self._try_number += 1
 
+        self.external_executor_id = external_executor_id
+
         if not test_mode:
             session.add(Log(State.RUNNING, self))
         self.state = State.RUNNING
-        self.external_executor_id = external_executor_id
+        
         self.end_date = None
         if not test_mode:
             session.merge(self)
@@ -1402,7 +1429,6 @@ class TaskInstance(Base, LoggingMixin):
         if not test_mode:
             session.add(Log(self.state, self))
             session.merge(self)
-
             session.commit()
 
     def _execute_task_with_callbacks(self, context):
@@ -1462,8 +1488,9 @@ class TaskInstance(Base, LoggingMixin):
             # Run post_execute callback
             self.task.post_execute(context=context, result=result)
 
-        Stats.incr(f'operator_successes_{self.task.task_type}', 1, 1)
-        Stats.incr('ti_successes')
+        print(f"---> operator success {self.dag_id} : {self.task_id}")
+        Stats.incr(f'operator_successes_{self.task.task_type}', 1, 1, attributes={"dag_id": self.dag_id, "task_id": self.task_id})
+        Stats.incr('ti_successes', attributes={"dag_id": self.dag_id, "task_id": self.task_id})
 
     @provide_session
     def _update_ti_state_for_sensing(self, session=None):
@@ -1612,7 +1639,6 @@ class TaskInstance(Base, LoggingMixin):
         pool: Optional[str] = None,
         session=None,
     ) -> None:
-        """Run TaskInstance"""
         res = self.check_and_change_state_before_execution(
             verbose=verbose,
             ignore_all_deps=ignore_all_deps,
@@ -1722,14 +1748,28 @@ class TaskInstance(Base, LoggingMixin):
             # can send its runtime errors for access by failure callback
             if error_file:
                 set_error_file(error_file, error)
+
         if not test_mode:
             self.refresh_from_db(session)
+            if error:
+                # --- HOWARD ---
+                # add error to span event
+                span = Trace.get_span_from_json(self.span_json)
+                span.set_attribute('error', 'true')
+                span.add_event("error", attributes={"message": str(error)})
+                if isinstance(error, Exception):
+                    ex_msg = ' '.join(traceback.format_exception(etype=type(error), value=error, tb=error.__traceback__))
+                    span.add_event("exception", attributes={"traceback": ex_msg})
+                self.span_json = span.to_json()
+                session.merge(self)
+                session.commit()
+                # --- END ---
 
         task = self.task
         self.end_date = timezone.utcnow()
         self.set_duration()
-        Stats.incr(f'operator_failures_{task.task_type}', 1, 1)
-        Stats.incr('ti_failures')
+        Stats.incr(f'operator_failures_{task.task_type}', 1, 1, attributes={"dag_id": task.dag_id, "task_id": task.task_id})
+        Stats.incr('ti_failures', attributes={"dag_id": task.dag_id, "task_id": task.task_id})
         if not test_mode:
             session.add(Log(State.FAILED, self))
 

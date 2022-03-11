@@ -43,7 +43,7 @@ from airflow.configuration import conf as airflow_conf
 from airflow.exceptions import AirflowException, TaskNotFound
 from airflow.models.base import COLLATION_ARGS, ID_LEN, Base
 from airflow.models.taskinstance import TaskInstance as TI
-from airflow.stats import Stats
+from airflow.stats import Stats, Trace
 from airflow.ti_deps.dep_context import DepContext
 from airflow.ti_deps.dependencies_states import SCHEDULEABLE_STATES
 from airflow.utils import callback_requests, timezone
@@ -52,6 +52,12 @@ from airflow.utils.session import provide_session
 from airflow.utils.sqlalchemy import UtcDateTime, nulls_first, skip_locked, with_row_locks
 from airflow.utils.state import DagRunState, State, TaskInstanceState
 from airflow.utils.types import DagRunType
+
+# --- HOWARD ---
+from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
+from opentelemetry.sdk import util
+import datetime as dt
+import json
 
 if TYPE_CHECKING:
     from airflow.models.dag import DAG
@@ -95,6 +101,7 @@ class DagRun(Base, LoggingMixin):
     # When a scheduler last attempted to schedule TIs for this DagRun
     last_scheduling_decision = Column(UtcDateTime)
     dag_hash = Column(String(32))
+    span_json = Column(PickleType)
 
     dag = None
 
@@ -146,6 +153,7 @@ class DagRun(Base, LoggingMixin):
         state: Optional[DagRunState] = None,
         run_type: Optional[str] = None,
         dag_hash: Optional[str] = None,
+        span_json: Optional[Any] = None,
         creating_job_id: Optional[int] = None,
         data_interval: Optional[Tuple[datetime, datetime]] = None,
     ):
@@ -169,7 +177,21 @@ class DagRun(Base, LoggingMixin):
             self.queued_at = queued_at
         self.run_type = run_type
         self.dag_hash = dag_hash
+        self.span_json = span_json
         self.creating_job_id = creating_job_id
+
+        # --- HOWARD ---
+        # -- initialize task span and store it into span_json
+        span_name = f"{self.__class__.__name__}-{self.run_type}"
+        span = Trace.start_span(service_name=span_name, span_name=self.dag_id)
+        span.set_attributes({
+            "dag_id": self.dag_id, "run_id": self.run_id, "run_type": self.run_type,
+            "dag_hash": self.dag_hash, "creating_job_id": self.creating_job_id,
+            "start_time": span._start_time, "operationName": self.dag_id
+        })
+        self.span_json = span.to_json()
+        print(f"DagRun -> {self.span_json}")
+
         super().__init__()
 
     def __repr__(self):
@@ -604,7 +626,18 @@ class DagRun(Base, LoggingMixin):
                 self.data_interval_end,
                 self.dag_hash,
             )
-
+            # --- HOWARD ---
+            span = Trace.get_span_from_json(self.span_json)
+            # mark the dag span's end
+            print(span.to_json())
+            span.set_attribute("state", self._state)
+            if self._state == State.FAILED:
+                span.set_attribute("error", "true")
+                Stats.incr("dagrun.failed.count", attributes={"dag_id": self.dag_id, "run_type": self.run_type})
+            else:
+                Stats.incr("dagrun.success.count", attributes={"dag_id": self.dag_id, "run_type": self.run_type})
+            span.end()
+        
         self._emit_true_scheduling_delay_stats_for_finished_state(finished_tasks)
         self._emit_duration_stats_for_finished_state()
 
@@ -754,9 +787,9 @@ class DagRun(Base, LoggingMixin):
 
         duration = self.end_date - self.start_date
         if self.state == State.SUCCESS:
-            Stats.timing(f'dagrun.duration.success.{self.dag_id}', duration)
+            Stats.timing(f'dagrun.duration.success.{self.dag_id}', duration, attributes={"dag_id": self.dag_id, "run_type": self.run_type})
         elif self.state == State.FAILED:
-            Stats.timing(f'dagrun.duration.failed.{self.dag_id}', duration)
+            Stats.timing(f'dagrun.duration.failed.{self.dag_id}', duration, attributes={"dag_id": self.dag_id, "run_type": self.run_type})
 
     @provide_session
     def verify_integrity(self, session: Session = None):

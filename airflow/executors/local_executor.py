@@ -40,6 +40,9 @@ from airflow.models.taskinstance import TaskInstanceKey, TaskInstanceStateType
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.state import State
 
+from airflow.stats import Trace
+from airflow.models.dag import DagRun
+
 # This is a work to be executed by a worker.
 # It can Key and Command - but it can also be None, None which is actually a
 # "Poison Pill" - worker seeing Poison Pill should take the pill and ... die instantly.
@@ -78,12 +81,31 @@ class LocalWorkerBase(Process, LoggingMixin):
 
         self.log.info("%s running %s", self.__class__.__name__, command)
         setproctitle(f"airflow worker -- LocalExecutor: {command}")
-        if settings.EXECUTE_TASKS_NEW_PYTHON_INTERPRETER:
-            state = self._execute_work_in_subprocess(command)
-        else:
-            state = self._execute_work_in_fork(command)
+        # --- HOWARD ---
+        session = settings.Session()
+        dagruns = DagRun.find(dag_id=key.dag_id, run_id=key.run_id, session=session)
+        if len(dagruns) == 1:
+            dagrun = dagruns[0]
+            ti = dagrun.get_task_instance(task_id=key.task_id, session=session)
+            span_name = f"{ti.task_id}-{command[1]}-{command[2]}"
+            execution_span = Trace.start_span_from_taskinstance(service_name=self.__class__.__name__, span_name=span_name, ti=ti)
+            execution_span.set_attributes({
+                    "command": f"{command[1]} {command[2]}",
+                    "dag_id": command[3],
+                    "task_id": command[4],
+                    "run_id": command[5]
+                })
 
-        self.result_queue.put((key, state))
+            if settings.EXECUTE_TASKS_NEW_PYTHON_INTERPRETER:
+                state = self._execute_work_in_subprocess(command)
+            else:
+                state = self._execute_work_in_fork(command)
+
+            self.result_queue.put((key, state))
+            # --- HOWARD ---
+            execution_span.set_attribute("state", state)
+            execution_span.end()
+
         # Remove the command since the worker is done executing the task
         setproctitle("airflow worker -- LocalExecutor")
 
